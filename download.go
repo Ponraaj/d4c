@@ -1,0 +1,322 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"golang.org/x/net/http2"
+)
+
+type DownloadState int
+
+const (
+	StateActive DownloadState = iota
+	StatePaused
+	StateCancelled
+	StateCompleted
+)
+
+type Download struct {
+	ID              int64          `json:"id"`
+	URL             string         `json:"url"`
+	TargetPath      string         `json:"path"`
+	TotalSize       int64          `json:"size"`
+	ChunkCount      int            `json:"chunks"`
+	Chunks          []*ChunkInfo   `json:"chunk_info"`
+	State           DownloadState  `json:"state"`
+	Mutex           sync.Mutex     `json:"-" `
+	WaitGroup       sync.WaitGroup `json:"-"`
+	Client          *http.Client   `json:"-"`
+	CompletedChunks int            `json:"completed_chunks"`
+	WorkersCount    int            `json:"workers"`
+}
+
+type ChunkInfo struct {
+	ID        int64         `json:"id"`
+	StartByte int64         `json:"start_byte"`
+	EndByte   int64         `json:"end_byte"`
+	Written   int64         `json:"written"`
+	Index     int           `json:"index"`
+	State     DownloadState `json:"state"`
+}
+
+func (d *Download) Initialize() error {
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		DisableKeepAlives:   false,
+		IdleConnTimeout:     90 * time.Second,
+	}
+
+	if err := http2.ConfigureTransport(transport); err != nil {
+		return fmt.Errorf("failed to configure HTTP/2: %w", err)
+	}
+
+	d.Client = &http.Client{
+		Transport: transport,
+	}
+
+	d.WorkersCount = min(d.WorkersCount, d.ChunkCount)
+
+	return nil
+}
+
+func NewDownload(url, targetPath string, chunks, workers int) (*Download, error) {
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		DisableKeepAlives:   false,
+		IdleConnTimeout:     90 * time.Second,
+	}
+
+	if err := http2.ConfigureTransport(transport); err != nil {
+		panic("failed to configure HTTP/2" + err.Error())
+	}
+
+	client := &http.Client{
+		Transport: transport,
+	}
+
+	res, err := client.Head(url)
+	if err != nil {
+		return nil, fmt.Errorf("error getting file info: %v", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("download is not available: %v", res.StatusCode)
+	}
+
+	size := res.ContentLength
+	targetDir := filepath.Dir(targetPath)
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		return nil, fmt.Errorf("failed to create target directory: %v", err)
+	}
+
+	download := &Download{
+		URL:          url,
+		TargetPath:   targetPath,
+		TotalSize:    size,
+		ChunkCount:   chunks,
+		State:        StateActive,
+		Client:       client,
+		WorkersCount: min(workers, chunks),
+	}
+
+	chunkSize := size / int64(chunks)
+
+	for i := range chunks {
+		start := chunkSize * int64(i)
+		end := start + chunkSize - 1
+
+		if i == chunks-1 {
+			end = size - 1
+		}
+
+		download.Chunks = append(download.Chunks, &ChunkInfo{
+			StartByte: start,
+			EndByte:   end,
+			Written:   0,
+			Index:     i,
+			State:     StateActive,
+		})
+	}
+
+	return download, nil
+}
+
+func (d *Download) DownloadChunk(chunk *ChunkInfo) error {
+	partPath := fmt.Sprintf("%s.part-%d", d.TargetPath, chunk.Index)
+
+	if info, err := os.Stat(partPath); err == nil {
+		chunk.Written = info.Size()
+		if chunk.Written >= (chunk.EndByte - chunk.StartByte + 1) {
+			d.Mutex.Lock()
+			d.CompletedChunks++
+			d.Mutex.Unlock()
+			return nil
+		}
+	}
+
+	file, err := os.OpenFile(partPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	req, err := http.NewRequest("GET", d.URL, nil)
+	if err != nil {
+		return err
+	}
+	start := chunk.StartByte + chunk.Written
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, chunk.EndByte))
+	req.Close = true
+
+	startTime := time.Now()
+
+	res, err := d.Client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusPartialContent && res.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status %d", res.StatusCode)
+	}
+
+	buffer := make([]byte, 128*1024)
+	written, err := io.CopyBuffer(file, res.Body, buffer)
+	if err != nil && err != io.EOF {
+		return err
+	}
+
+	d.Mutex.Lock()
+	chunk.Written += written
+	chunk.State = StateCompleted
+	d.CompletedChunks++
+	d.Mutex.Unlock()
+
+	fmt.Printf("Chunk %v downloaded in %v \n", chunk.Index+1, time.Since(startTime))
+	return nil
+}
+
+func (d *Download) Pause() {
+	d.Mutex.Lock()
+	defer d.Mutex.Unlock()
+
+	if d.State == StateActive {
+		d.State = StatePaused
+		for _, chunk := range d.Chunks {
+			if chunk.State == StateActive {
+				chunk.State = StatePaused
+			}
+		}
+		fmt.Println("Download paused")
+	}
+}
+
+func (d *Download) Resume(ctx context.Context) {
+	d.Mutex.Lock()
+	defer d.Mutex.Unlock()
+
+	if d.State == StatePaused {
+		d.State = StateActive
+		for _, chunk := range d.Chunks {
+			if chunk.State == StatePaused {
+				chunk.State = StateActive
+			}
+		}
+		if err := d.Start(ctx); err != nil {
+			panic(err)
+		}
+		fmt.Println("Download resumed")
+	}
+}
+
+func (d *Download) Cancel() {
+	d.Mutex.Lock()
+	defer d.Mutex.Unlock()
+
+	d.State = StateCancelled
+	for _, chunk := range d.Chunks {
+		chunk.State = StateCancelled
+	}
+	fmt.Println("Download cancelled")
+}
+
+func (d *Download) Start(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	workers := make(chan *ChunkInfo, d.WorkersCount)
+	startTime := time.Now()
+
+	for i := 0; i < d.WorkersCount; i++ {
+		go d.worker(workers)
+	}
+
+	for _, chunk := range d.Chunks {
+		if chunk.State == StateCompleted {
+			continue
+		}
+		d.WaitGroup.Add(1)
+		workers <- chunk
+	}
+	close(workers)
+
+	done := make(chan struct{})
+	go func() {
+		d.WaitGroup.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return fmt.Errorf("Download Canceled")
+	}
+
+	if d.State == StateCancelled {
+		return fmt.Errorf("download cancelled")
+	}
+
+	if err := d.combineChunks(); err != nil {
+		fmt.Printf("Total download time: %v\n", time.Since(startTime))
+		return fmt.Errorf("error combining chunks: %w", err)
+	}
+	d.cleanup()
+
+	fmt.Println("Download Complete !!")
+	fmt.Printf("Total download time: %v\n", time.Since(startTime))
+	return nil
+}
+
+func (d *Download) worker(workers <-chan *ChunkInfo) {
+	for chunk := range workers {
+		err := d.DownloadChunk(chunk)
+		if err != nil && d.State != StateCancelled {
+			fmt.Printf("Error downloading chunk %d: %v\n", chunk.Index, err)
+		}
+		d.WaitGroup.Done()
+	}
+}
+
+func (d *Download) combineChunks() error {
+	fmt.Println("Combining Chunks !!")
+	targetFile, err := os.Create(d.TargetPath)
+	if err != nil {
+		return err
+	}
+	defer targetFile.Close()
+
+	for i := range d.Chunks {
+		partPath := fmt.Sprintf("%v.part-%v", d.TargetPath, i)
+		partFile, err := os.Open(partPath)
+		if err != nil {
+			return fmt.Errorf("opening part %d: %w", i, err)
+		}
+
+		if _, err := io.Copy(targetFile, partFile); err != nil {
+			partFile.Close()
+			return fmt.Errorf("copying part %d: %w", i, err)
+		}
+		partFile.Close()
+
+	}
+	return nil
+}
+
+func (d *Download) cleanup() {
+	for i := range d.Chunks {
+		partPath := fmt.Sprintf("%s.part-%d", d.TargetPath, i)
+		if err := os.Remove(partPath); err != nil {
+			fmt.Printf("warning: failed to remove %s: %v\n", partPath, err)
+		}
+	}
+}
