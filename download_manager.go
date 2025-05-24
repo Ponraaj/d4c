@@ -17,6 +17,10 @@ type DownloadManager struct {
 	ActiveContexts map[int64]context.CancelFunc
 }
 
+type ChunkWriter interface {
+	UpdateChunkState(chunk *ChunkInfo) error
+}
+
 func NewDownloadManager(dbPath string) (*DownloadManager, error) {
 	db, err := initDB(dbPath)
 	if err != nil {
@@ -97,6 +101,7 @@ func (dm *DownloadManager) AddDownload(url, path string, chunks, workers int) (e
 	}
 	if existing != nil {
 		dm.Downloads[existing.ID] = existing
+		existing.ChunkWriter = dm
 
 		if existing.State != StateCompleted && existing.State != StateCancelled {
 			return dm.StartDownload(existing.ID)
@@ -105,6 +110,7 @@ func (dm *DownloadManager) AddDownload(url, path string, chunks, workers int) (e
 	}
 
 	d, err := NewDownload(url, path, chunks, workers)
+	d.ChunkWriter = dm
 	if err != nil {
 		return err
 	}
@@ -201,12 +207,9 @@ func (dm *DownloadManager) UpdateDownloadStateByID(id int64, state DownloadState
 }
 
 func (dm *DownloadManager) UpdateChunkState(chunk *ChunkInfo) error {
-	if chunk.State == StateCompleted {
-		return nil
-	}
 	_, err := dm.DB.Exec(
-		"UPDATE chunks SET state = ?, written = ? WHERE id = ? AND state != ?",
-		chunk.State, chunk.Written, chunk.ID, StateCompleted,
+		"UPDATE chunks SET state = ?, written = ? WHERE id = ?",
+		chunk.State, chunk.Written, chunk.ID,
 	)
 	return err
 }
@@ -215,6 +218,15 @@ func (dm *DownloadManager) PauseDownload(id int64) error {
 	d, ok := dm.Downloads[id]
 	if !ok {
 		return fmt.Errorf("download with ID %d not found", id)
+	}
+
+	dm.Mutex.Lock()
+	defer dm.Mutex.Unlock()
+
+	cancel, exists := dm.ActiveContexts[id]
+	if exists {
+		cancel()
+		delete(dm.ActiveContexts, id)
 	}
 	d.Pause()
 	return dm.UpdateDownloadStateByID(id, StatePaused)
