@@ -37,6 +37,8 @@ type Download struct {
 	WorkersCount    int             `json:"workers"`
 	ChunkWriter     ChunkWriter     `json:"-"`
 	WorkerChannel   chan *ChunkInfo `json:"-"`
+	lastUpdate      time.Time       `json:"-"`
+	updateMutex     sync.Mutex      `json:"-"`
 }
 
 type ChunkInfo struct {
@@ -47,6 +49,22 @@ type ChunkInfo struct {
 	Index     int           `json:"index"`
 	State     DownloadState `json:"state"`
 }
+
+type DownloadUpdateEvent struct {
+	DownloadID int64         `json:"downloadId"`
+	State      DownloadState `json:"state"`
+}
+
+type ChunkUpdateEvent struct {
+	DownloadID int64         `json:"downloadId"`
+	ChunkIndex int           `json:"chunkIndex"`
+	ChunkID    int64         `json:"chunkId"`
+	Written    int64         `json:"written"`
+	TotalSize  int64         `json:"size"`
+	State      DownloadState `json:"state"`
+}
+
+var UpdateFrequency = 200 * time.Millisecond
 
 func (d *Download) Initialize() error {
 	transport := &http.Transport{
@@ -65,7 +83,7 @@ func (d *Download) Initialize() error {
 	}
 
 	d.WorkersCount = min(d.WorkersCount, d.ChunkCount)
-	d.WorkerChannel = make(chan *ChunkInfo, d.WorkersCount)
+	d.lastUpdate = time.Now()
 	return nil
 }
 
@@ -156,6 +174,7 @@ func (d *Download) DownloadChunk(ctx context.Context, chunk *ChunkInfo) error {
 			if err != nil {
 				fmt.Printf("Failed to update chunk state in DB: %v\n", err)
 			}
+			d.notify(chunk)
 		}
 		return nil
 	}
@@ -200,6 +219,7 @@ func (d *Download) DownloadChunk(ctx context.Context, chunk *ChunkInfo) error {
 			d.Mutex.Unlock()
 			if d.ChunkWriter != nil {
 				_ = d.ChunkWriter.UpdateChunkState(chunk)
+				d.notify(chunk)
 			}
 			return fmt.Errorf("download canceled for chunk %v\n", chunk.Index)
 		default:
@@ -210,6 +230,10 @@ func (d *Download) DownloadChunk(ctx context.Context, chunk *ChunkInfo) error {
 				}
 				d.Mutex.Lock()
 				chunk.Written += int64(n)
+				if d.ChunkWriter != nil {
+					_ = d.ChunkWriter.UpdateChunkState(chunk)
+					d.notify(chunk)
+				}
 				d.Mutex.Unlock()
 			}
 			if readErr != nil {
@@ -224,6 +248,7 @@ func (d *Download) DownloadChunk(ctx context.Context, chunk *ChunkInfo) error {
 						if err != nil {
 							fmt.Printf("Failed to update chunk state in DB: %v\n", err)
 						}
+						d.notify(chunk)
 					}
 					d.Mutex.Unlock()
 
@@ -250,11 +275,15 @@ func (d *Download) Pause() {
 					if err != nil {
 						fmt.Printf("Failed to update chunk state in DB: %v\n", err)
 					}
+					d.notify(chunk)
 				}
 			}
 		}
 		fmt.Println("Download paused")
 	}
+
+	d.ChunkWriter.NotifyDownloadUpdate(d.ID, StatePaused)
+	d.State = StatePaused
 }
 
 func (d *Download) Resume(ctx context.Context) {
@@ -271,12 +300,15 @@ func (d *Download) Resume(ctx context.Context) {
 					if err != nil {
 						fmt.Printf("Failed to update chunk state in DB: %v\n", err)
 					}
+					d.notify(chunk)
 				}
 			}
 		}
 
 		d.WaitGroup = sync.WaitGroup{}
 		d.WorkerChannel = make(chan *ChunkInfo, d.WorkersCount)
+		d.State = StateActive
+		d.ChunkWriter.NotifyDownloadUpdate(d.ID, StateActive)
 
 		go func() {
 			if err := d.Start(ctx); err != nil {
@@ -298,17 +330,23 @@ func (d *Download) Cancel() {
 			if err != nil {
 				fmt.Printf("Failed to update chunk state in DB: %v\n", err)
 			}
+			d.notify(chunk)
 		}
 	}
+	d.ChunkWriter.NotifyDownloadUpdate(d.ID, StateCancelled)
 	fmt.Println("Download cancelled")
 }
 
 func (d *Download) Start(ctx context.Context) error {
+	d.ChunkWriter.NotifyDownloadUpdate(d.ID, StateActive)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	startTime := time.Now()
 
+	if d.WorkerChannel == nil {
+		d.WorkerChannel = make(chan *ChunkInfo, d.WorkersCount)
+	}
 	for i := 0; i < d.WorkersCount; i++ {
 		go d.worker(ctx)
 	}
@@ -320,7 +358,10 @@ func (d *Download) Start(ctx context.Context) error {
 		d.WaitGroup.Add(1)
 		d.WorkerChannel <- chunk
 	}
+
+	d.Mutex.Lock()
 	close(d.WorkerChannel)
+	d.Mutex.Unlock()
 
 	done := make(chan struct{})
 	go func() {
@@ -345,6 +386,8 @@ func (d *Download) Start(ctx context.Context) error {
 		fmt.Printf("Total download time: %v\n", time.Since(startTime))
 		return fmt.Errorf("error combining chunks: %w\n", err)
 	}
+	d.State = StateCompleted
+	d.ChunkWriter.NotifyDownloadUpdate(d.ID, StateCompleted)
 	d.cleanup()
 
 	fmt.Println("Download Complete !!")
@@ -361,15 +404,17 @@ func (d *Download) worker(ctx context.Context) {
 			if !ok {
 				return
 			}
-			err := d.DownloadChunk(ctx, chunk)
-			if err != nil {
-				if ctx.Err() != nil {
-					fmt.Printf("Download cancelled while processing: %v\n", err)
-				} else {
-					fmt.Printf("Error downloading chunk %d: %v\n", chunk.Index, err)
+			func() {
+				defer d.WaitGroup.Done()
+				err := d.DownloadChunk(ctx, chunk)
+				if err != nil {
+					if ctx.Err() != nil {
+						fmt.Printf("Download cancelled while processing: %v\n", err)
+					} else {
+						fmt.Printf("Error downloading chunk %d: %v\n", chunk.Index, err)
+					}
 				}
-			}
-			d.WaitGroup.Done()
+			}()
 		}
 	}
 }
@@ -384,6 +429,17 @@ func (d *Download) isAllChunksCompleted() bool {
 		}
 	}
 	return true
+}
+
+func (d *Download) notify(chunk *ChunkInfo) {
+	d.updateMutex.Lock()
+	defer d.updateMutex.Unlock()
+
+	now := time.Now()
+	if now.Sub(d.lastUpdate) >= UpdateFrequency {
+		d.ChunkWriter.NotifyChunkUpdate(d.ID, chunk)
+		d.lastUpdate = now
+	}
 }
 
 func (d *Download) combineChunks() error {

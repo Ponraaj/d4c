@@ -8,8 +8,14 @@ export function AllDownloads():Promise<Array<main.Download>>;
 
 export function CancelDownload(arg1:number):Promise<void>;
 
+export function GetDefaultDownloadPath():Promise<string>;
+
 export function Greet(arg1:string):Promise<string>;
 
 export function PauseDownload(arg1:number):Promise<void>;
 
 export function ResumeDownload(arg1:number):Promise<void>;
+
+export function ShowDirectoryDialog(arg1:string):Promise<string>;
+
+export function ShowFileDialog(arg1:string,arg2:string):Promise<string>;
