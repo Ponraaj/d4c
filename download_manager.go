@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 type DownloadManager struct {
@@ -15,13 +16,16 @@ type DownloadManager struct {
 	Downloads      map[int64]*Download
 	Mutex          sync.Mutex
 	ActiveContexts map[int64]context.CancelFunc
+	appCtx         context.Context
 }
 
 type ChunkWriter interface {
 	UpdateChunkState(chunk *ChunkInfo) error
+	NotifyChunkUpdate(downloadID int64, chunk *ChunkInfo)
+	NotifyDownloadUpdate(downloadID int64, state DownloadState)
 }
 
-func NewDownloadManager(dbPath string) (*DownloadManager, error) {
+func NewDownloadManager(dbPath string, appCtx context.Context) (*DownloadManager, error) {
 	db, err := initDB(dbPath)
 	if err != nil {
 		return nil, err
@@ -31,6 +35,7 @@ func NewDownloadManager(dbPath string) (*DownloadManager, error) {
 		DB:             db,
 		Downloads:      make(map[int64]*Download),
 		ActiveContexts: make(map[int64]context.CancelFunc),
+		appCtx:         appCtx,
 	}
 
 	if err := dm.LoadFromDB(); err != nil {
@@ -70,14 +75,45 @@ func (dm *DownloadManager) LoadFromDB() error {
 
 		chunkRows.Close()
 		d.Chunks = chunks
-		d.Initialize()
 		dm.Downloads[d.ID] = &d
-		if err := dm.StartDownload(d.ID); err != nil {
-			return err
+		d.ChunkWriter = dm
+		if d.State != StateCompleted {
+			d.Initialize()
+			dm.Downloads[d.ID] = &d
+			d.ChunkWriter = dm
+			if err := dm.StartDownload(d.ID); err != nil {
+				return err
+			}
+
 		}
 	}
 
 	return nil
+}
+
+func (dm *DownloadManager) NotifyChunkUpdate(downloadID int64, chunk *ChunkInfo) {
+	if dm.appCtx != nil && chunk != nil {
+		payload := ChunkUpdateEvent{
+			DownloadID: downloadID,
+			ChunkIndex: chunk.Index,
+			ChunkID:    chunk.ID,
+			Written:    chunk.Written,
+			TotalSize:  (chunk.EndByte - chunk.StartByte + 1),
+			State:      chunk.State,
+		}
+
+		runtime.EventsEmit(dm.appCtx, "chunkUpdate", payload)
+	}
+}
+
+func (dm *DownloadManager) NotifyDownloadUpdate(downloadID int64, state DownloadState) {
+	if dm.appCtx != nil {
+		payload := DownloadUpdateEvent{
+			DownloadID: downloadID,
+			State:      state,
+		}
+		runtime.EventsEmit(dm.appCtx, "downloadUpdate", payload)
+	}
 }
 
 func (dm *DownloadManager) AllDownloads() []*Download {
@@ -233,6 +269,8 @@ func (dm *DownloadManager) PauseDownload(id int64) error {
 }
 
 func (dm *DownloadManager) ResumeDownload(id int64) error {
+	dm.Mutex.Lock()
+	defer dm.Mutex.Unlock()
 	d, ok := dm.Downloads[id]
 	if !ok {
 		return fmt.Errorf("download with ID %d not found", id)

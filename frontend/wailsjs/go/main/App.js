@@ -14,6 +14,10 @@ export function CancelDownload(arg1) {
   return window['go']['main']['App']['CancelDownload'](arg1);
 }
 
+export function GetDefaultDownloadPath() {
+  return window['go']['main']['App']['GetDefaultDownloadPath']();
+}
+
 export function Greet(arg1) {
   return window['go']['main']['App']['Greet'](arg1);
 }
@@ -24,4 +28,12 @@ export function PauseDownload(arg1) {
 
 export function ResumeDownload(arg1) {
   return window['go']['main']['App']['ResumeDownload'](arg1);
+}
+
+export function ShowDirectoryDialog(arg1) {
+  return window['go']['main']['App']['ShowDirectoryDialog'](arg1);
+}
+
+export function ShowFileDialog(arg1, arg2) {
+  return window['go']['main']['App']['ShowFileDialog'](arg1, arg2);
 }
