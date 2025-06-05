@@ -286,7 +286,7 @@ func (d *Download) Pause() {
 	d.State = StatePaused
 }
 
-func (d *Download) Resume(ctx context.Context) {
+func (d *Download) Resume() {
 	d.Mutex.Lock()
 	defer d.Mutex.Unlock()
 
@@ -310,11 +310,11 @@ func (d *Download) Resume(ctx context.Context) {
 		d.State = StateActive
 		d.ChunkWriter.NotifyDownloadUpdate(d.ID, StateActive)
 
-		go func() {
-			if err := d.Start(ctx); err != nil {
-				fmt.Printf("Resume failed: %v\n", err)
-			}
-		}()
+		// go func() {
+		// 	if err := d.Start(ctx); err != nil {
+		// 		fmt.Printf("Resume failed: %v\n", err)
+		// 	}
+		// }()
 	}
 }
 
@@ -339,15 +339,15 @@ func (d *Download) Cancel() {
 
 func (d *Download) Start(ctx context.Context) error {
 	d.ChunkWriter.NotifyDownloadUpdate(d.ID, StateActive)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 
 	startTime := time.Now()
 
 	if d.WorkerChannel == nil {
 		d.WorkerChannel = make(chan *ChunkInfo, d.WorkersCount)
 	}
+	d.WaitGroup = sync.WaitGroup{}
 	for i := 0; i < d.WorkersCount; i++ {
+		d.WaitGroup.Add(1)
 		go d.worker(ctx)
 	}
 
@@ -355,13 +355,8 @@ func (d *Download) Start(ctx context.Context) error {
 		if chunk.State == StateCompleted {
 			continue
 		}
-		d.WaitGroup.Add(1)
 		d.WorkerChannel <- chunk
 	}
-
-	d.Mutex.Lock()
-	close(d.WorkerChannel)
-	d.Mutex.Unlock()
 
 	done := make(chan struct{})
 	go func() {
@@ -374,28 +369,31 @@ func (d *Download) Start(ctx context.Context) error {
 		if !d.isAllChunksCompleted() {
 			return fmt.Errorf("not all chunks completed successfully")
 		}
+
+		if d.State == StateCancelled {
+			return fmt.Errorf("download cancelled")
+		}
+
+		if err := d.combineChunks(); err != nil {
+			fmt.Printf("Total download time: %v\n", time.Since(startTime))
+			return fmt.Errorf("error combining chunks: %w\n", err)
+		}
+		d.State = StateCompleted
+		d.ChunkWriter.NotifyDownloadUpdate(d.ID, StateCompleted)
+		d.cleanup()
+
+		fmt.Println("Download Complete !!")
+		fmt.Printf("Total download time: %v\n", time.Since(startTime))
+		return nil
 	case <-ctx.Done():
+		close(d.WorkerChannel)
+		d.WaitGroup.Wait()
 		return fmt.Errorf("Download Canceled")
 	}
-
-	if d.State == StateCancelled {
-		return fmt.Errorf("download cancelled")
-	}
-
-	if err := d.combineChunks(); err != nil {
-		fmt.Printf("Total download time: %v\n", time.Since(startTime))
-		return fmt.Errorf("error combining chunks: %w\n", err)
-	}
-	d.State = StateCompleted
-	d.ChunkWriter.NotifyDownloadUpdate(d.ID, StateCompleted)
-	d.cleanup()
-
-	fmt.Println("Download Complete !!")
-	fmt.Printf("Total download time: %v\n", time.Since(startTime))
-	return nil
 }
 
 func (d *Download) worker(ctx context.Context) {
+	defer d.WaitGroup.Done()
 	for {
 		select {
 		case <-ctx.Done():
@@ -404,17 +402,14 @@ func (d *Download) worker(ctx context.Context) {
 			if !ok {
 				return
 			}
-			func() {
-				defer d.WaitGroup.Done()
-				err := d.DownloadChunk(ctx, chunk)
-				if err != nil {
-					if ctx.Err() != nil {
-						fmt.Printf("Download cancelled while processing: %v\n", err)
-					} else {
-						fmt.Printf("Error downloading chunk %d: %v\n", chunk.Index, err)
-					}
+			err := d.DownloadChunk(ctx, chunk)
+			if err != nil {
+				if ctx.Err() != nil {
+					fmt.Printf("Download cancelled while processing: %v\n", err)
+				} else {
+					fmt.Printf("Error downloading chunk %d: %v\n", chunk.Index, err)
 				}
-			}()
+			}
 		}
 	}
 }
@@ -436,7 +431,7 @@ func (d *Download) notify(chunk *ChunkInfo) {
 	defer d.updateMutex.Unlock()
 
 	now := time.Now()
-	if now.Sub(d.lastUpdate) >= UpdateFrequency {
+	if now.Sub(d.lastUpdate) >= UpdateFrequency || chunk.State == StateCompleted {
 		d.ChunkWriter.NotifyChunkUpdate(d.ID, chunk)
 		d.lastUpdate = now
 	}

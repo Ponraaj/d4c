@@ -110,7 +110,7 @@ func (dm *DownloadManager) NotifyDownloadUpdate(downloadID int64, state Download
 	if dm.appCtx != nil {
 		payload := DownloadUpdateEvent{
 			DownloadID: downloadID,
-			State:      state,
+			State:      dm.Downloads[downloadID].State,
 		}
 		runtime.EventsEmit(dm.appCtx, "downloadUpdate", payload)
 	}
@@ -202,6 +202,10 @@ func (dm *DownloadManager) StartDownload(id int64) error {
 		return fmt.Errorf("download already completed")
 	}
 
+	if cancel, exists := dm.ActiveContexts[id]; exists {
+		cancel()
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	dm.ActiveContexts[id] = cancel
 
@@ -277,7 +281,14 @@ func (dm *DownloadManager) ResumeDownload(id int64) error {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	dm.ActiveContexts[id] = cancel
-	d.Resume(ctx)
+	d.Resume()
+
+	go func() {
+		err := d.Start(ctx)
+		if err != nil && err.Error() != "download canceled" {
+			fmt.Printf("error resuming download: %v\n", err)
+		}
+	}()
 
 	return dm.UpdateDownloadStateByID(id, StateActive)
 }

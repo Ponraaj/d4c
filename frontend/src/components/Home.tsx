@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { ChevronDown, ChevronUp, Download, Pause, Play, X } from "lucide-react";
+import { useEffect, useState, useRef, useCallback } from "react";
+import { Download, Pause, Play, X, ChevronDown, ChevronUp } from "lucide-react";
 import {
   AllDownloads,
   PauseDownload,
@@ -16,13 +16,27 @@ const AppDownloadState = {
   Completed: 3,
 };
 
-interface ChunkUpdateEventPayload {
+interface ChunkUpdateEvent {
   downloadId: number;
   chunkIndex: number;
   chunkId: number;
   written: number;
   size: number;
   state: number;
+}
+
+interface DownloadUpdateEvent {
+  downloadId: number;
+  state: number;
+}
+
+interface DownloadStats {
+  progress: number;
+  speed: number;
+  eta: number;
+  totalWritten: number;
+  lastUpdateTime: number;
+  lastTotalWritten: number;
 }
 
 const getDownloadStateString = (state: number) => {
@@ -53,7 +67,7 @@ const formatSpeed = (bytesPerSecond: number) => {
 };
 
 const formatTime = (seconds: number) => {
-  if (!seconds || !isFinite(seconds)) return "--";
+  if (!seconds || !isFinite(seconds) || seconds <= 0) return "--";
 
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
@@ -90,24 +104,176 @@ const getProgressColor = (state: number) => {
     case AppDownloadState.Completed:
       return "bg-green-500";
     default:
-      return "bg-gray-500";
+      return "bg-gray-300";
   }
 };
+
+const getChunkStateColor = (state: number, progress: number = 0) => {
+  switch (state) {
+    case AppDownloadState.Active:
+      if (progress > 80) return "bg-blue-500";
+      if (progress > 40) return "bg-blue-400";
+      if (progress > 0) return "bg-blue-300";
+      return "bg-blue-200";
+    case AppDownloadState.Paused:
+      if (progress > 80) return "bg-yellow-500";
+      if (progress > 40) return "bg-yellow-400";
+      if (progress > 0) return "bg-yellow-300";
+      return "bg-yellow-200";
+    case AppDownloadState.Cancelled:
+      return "bg-red-400";
+    case AppDownloadState.Completed:
+      return "bg-green-500";
+    default:
+      return "bg-gray-200";
+  }
+};
+
+const getCorrectDownloadState = (download: models.main.Download): number => {
+  if (!download.chunk_info || download.chunk_info.length === 0) {
+    return download.state;
+  }
+
+  const completedChunks = download.chunk_info.filter(
+    (chunk) => chunk.state === AppDownloadState.Completed,
+  ).length;
+
+  const cancelledChunks = download.chunk_info.filter(
+    (chunk) => chunk.state === AppDownloadState.Cancelled,
+  ).length;
+
+  const activeChunks = download.chunk_info.filter(
+    (chunk) => chunk.state === AppDownloadState.Active,
+  ).length;
+
+  if (completedChunks === download.chunks && download.chunks > 0) {
+    return AppDownloadState.Completed;
+  }
+
+  if (cancelledChunks > 0) {
+    return AppDownloadState.Cancelled;
+  }
+
+  if (activeChunks > 0) {
+    return AppDownloadState.Active;
+  }
+
+  const pausedOrCompletedChunks = download.chunk_info.filter(
+    (chunk) =>
+      chunk.state === AppDownloadState.Paused ||
+      chunk.state === AppDownloadState.Completed,
+  ).length;
+
+  if (pausedOrCompletedChunks === download.chunk_info.length) {
+    return AppDownloadState.Paused;
+  }
+
+  return download.state;
+};
+
+function updateDownload(
+  prev: models.main.Download[],
+  downloadId: number,
+  updater: (dl: models.main.Download) => models.main.Download,
+): models.main.Download[] {
+  return prev.map((dl) => {
+    if (dl.id === downloadId) {
+      return updater(dl);
+    }
+    return dl;
+  });
+}
 
 export default function Home() {
   const [downloads, setDownloads] = useState<models.main.Download[]>([]);
   const [expandedDownloads, setExpandedDownloads] = useState<Set<number>>(
     new Set(),
   );
-  const [downloadStats, setDownloadStats] = useState<Record<number, any>>({});
-  const [lastUpdateTime, setLastUpdateTime] = useState<Record<number, number>>(
-    {},
+  const [downloadStats, setDownloadStats] = useState<
+    Record<number, DownloadStats>
+  >({});
+
+  const eventCleanupRef = useRef<(() => void)[]>([]);
+  const statsIntervalRef = useRef<number | null>(null);
+  const downloadsRef = useRef<models.main.Download[]>([]);
+  const statsRef = useRef<Record<number, DownloadStats>>({});
+
+  useEffect(() => {
+    downloadsRef.current = downloads;
+  }, [downloads]);
+
+  useEffect(() => {
+    statsRef.current = downloadStats;
+  }, [downloadStats]);
+
+  const calculateDownloadStats = useCallback(
+    (download: models.main.Download): DownloadStats => {
+      const totalWritten =
+        download.chunk_info?.reduce((sum, chunk) => sum + chunk.written, 0) ||
+        0;
+      const progress =
+        download.size > 0 ? (totalWritten / download.size) * 100 : 0;
+
+      const currentTime = Date.now();
+      const lastStats = statsRef.current[download.id];
+
+      let speed = 0;
+      let eta = 0;
+
+      if (lastStats && download.state === AppDownloadState.Active) {
+        const timeDiff = (currentTime - lastStats.lastUpdateTime) / 1000;
+        const bytesDiff = totalWritten - lastStats.lastTotalWritten;
+
+        if (timeDiff > 0 && bytesDiff > 0) {
+          speed = bytesDiff / timeDiff;
+          const remainingBytes = download.size - totalWritten;
+          eta = speed > 0 ? remainingBytes / speed : 0;
+        } else if (lastStats.speed > 0) {
+          speed = lastStats.speed * 0.8;
+          const remainingBytes = download.size - totalWritten;
+          eta = speed > 0 ? remainingBytes / speed : 0;
+        }
+      }
+
+      return {
+        progress: Math.min(progress, 100),
+        speed,
+        eta,
+        totalWritten,
+        lastUpdateTime: currentTime,
+        lastTotalWritten: totalWritten,
+      };
+    },
+    [],
   );
 
   const initializeDownloads = async () => {
     try {
       const data = await AllDownloads();
-      setDownloads(data || []);
+      const downloadsData = data || [];
+
+      const correctedDownloads = downloadsData.map((dl) => {
+        const correctState = getCorrectDownloadState(dl);
+        const completedChunks =
+          dl.chunk_info?.filter(
+            (chunk) => chunk.state === AppDownloadState.Completed,
+          ).length || 0;
+
+        return {
+          ...dl,
+          state: correctState,
+          completed_chunks: completedChunks,
+        };
+      });
+      //@ts-ignore
+      setDownloads(correctedDownloads);
+
+      const initialStats: Record<number, DownloadStats> = {};
+      correctedDownloads.forEach((dl) => {
+        //@ts-ignore
+        initialStats[dl.id] = calculateDownloadStats(dl);
+      });
+      setDownloadStats(initialStats);
     } catch (error) {
       console.error("Failed to fetch downloads:", error);
       setDownloads([]);
@@ -115,38 +281,15 @@ export default function Home() {
   };
 
   const toggleExpanded = (downloadId: number) => {
-    const newExpanded = new Set(expandedDownloads);
-    if (newExpanded.has(downloadId)) {
-      newExpanded.delete(downloadId);
-    } else {
-      newExpanded.add(downloadId);
-    }
-    setExpandedDownloads(newExpanded);
-  };
-
-  const calculateDownloadStats = (download: models.main.Download) => {
-    const totalWritten =
-      download.chunk_info?.reduce((sum, chunk) => sum + chunk.written, 0) || 0;
-    const progress =
-      download.size > 0 ? (totalWritten / download.size) * 100 : 0;
-
-    const currentTime = Date.now();
-    const lastTime = lastUpdateTime[download.id];
-    const lastStats = downloadStats[download.id];
-
-    let speed = 0;
-    if (lastTime && lastStats && download.state === AppDownloadState.Active) {
-      const timeDiff = (currentTime - lastTime) / 1000; // seconds
-      const bytesDiff = totalWritten - (lastStats.totalWritten || 0);
-      if (timeDiff > 0) {
-        speed = bytesDiff / timeDiff;
+    setExpandedDownloads((prev) => {
+      const newExpanded = new Set(prev);
+      if (newExpanded.has(downloadId)) {
+        newExpanded.delete(downloadId);
+      } else {
+        newExpanded.add(downloadId);
       }
-    }
-
-    const remainingBytes = download.size - totalWritten;
-    const eta = speed > 0 ? remainingBytes / speed : 0;
-
-    return { progress, speed, eta, totalWritten };
+      return newExpanded;
+    });
   };
 
   const getFileName = (url: string) => {
@@ -154,114 +297,127 @@ export default function Home() {
   };
 
   useEffect(() => {
-    initializeDownloads();
-  }, []);
+    eventCleanupRef.current.forEach((cleanup) => cleanup());
+    eventCleanupRef.current = [];
 
-  useEffect(() => {
-    const cleanupChunkUpdate = EventsOn(
+    const chunkUpdateCleanup = EventsOn(
       "chunkUpdate",
-      (payload: ChunkUpdateEventPayload) => {
-        setDownloads((prevDownloads) =>
-          prevDownloads.map((dl) => {
-            if (dl.id === payload.downloadId) {
-              const updatedChunkInfo = dl.chunk_info.map((chunk) => {
-                if (payload.chunkId !== 0 && chunk.id === payload.chunkId) {
-                  return {
-                    ...chunk,
-                    written: payload.written,
-                    state: payload.state,
-                  };
-                } else if (chunk.index === payload.chunkIndex) {
-                  return {
-                    ...chunk,
-                    written: payload.written,
-                    state: payload.state,
-                  };
-                }
-                return chunk;
-              });
+      (payload: ChunkUpdateEvent) => {
+        console.log("Chunk update received:", payload);
 
-              const completedChunksCount = updatedChunkInfo.filter(
-                (c) => c.state === AppDownloadState.Completed,
-              ).length;
+        setDownloads((prev) =>
+          // @ts-ignore
+          updateDownload(prev, payload.downloadId, (dl) => {
+            if (!dl.chunk_info) return dl;
 
-              let overallState = dl.state;
-              if (completedChunksCount === dl.chunks && dl.chunks > 0) {
-                overallState = AppDownloadState.Completed;
-              } else if (
-                updatedChunkInfo.some(
-                  (c) => c.state === AppDownloadState.Active,
-                )
+            const updatedChunks = dl.chunk_info.map((chunk) => {
+              if (
+                (payload.chunkId !== 0 && chunk.id === payload.chunkId) ||
+                chunk.index === payload.chunkIndex
               ) {
-                overallState = AppDownloadState.Active;
-              } else if (
-                updatedChunkInfo.every(
-                  (c) =>
-                    c.state === AppDownloadState.Paused ||
-                    c.state === AppDownloadState.Completed,
-                ) &&
-                updatedChunkInfo.some(
-                  (c) => c.state === AppDownloadState.Paused,
-                )
-              ) {
-                overallState = AppDownloadState.Paused;
+                return {
+                  ...chunk,
+                  written: payload.written,
+                  state: payload.state,
+                };
               }
+              return chunk;
+            });
 
-              const updatedDownloadData = {
-                ...dl,
-                chunk_info: updatedChunkInfo,
-                completed_chunks: completedChunksCount,
-                state: overallState,
-              };
+            const completed = updatedChunks.filter(
+              (c) => c.state === AppDownloadState.Completed,
+            ).length;
 
-              // Update stats for speed calculation
-              setLastUpdateTime((prev) => ({ ...prev, [dl.id]: Date.now() }));
-
-              return models.main.Download.createFrom(updatedDownloadData);
+            let newState = dl.state;
+            if (completed === dl.chunks && dl.chunks > 0) {
+              newState = AppDownloadState.Completed;
+            } else if (
+              updatedChunks.some((c) => c.state === AppDownloadState.Active)
+            ) {
+              newState = AppDownloadState.Active;
+            } else if (
+              updatedChunks.every(
+                (c) =>
+                  c.state === AppDownloadState.Paused ||
+                  c.state === AppDownloadState.Completed,
+              )
+            ) {
+              newState = AppDownloadState.Paused;
             }
-            return dl;
+
+            return {
+              ...dl,
+              chunk_info: updatedChunks,
+              completed_chunks: completed,
+              state: newState,
+            };
           }),
         );
       },
     );
 
-    const cleanupDownloadUpdate = EventsOn(
+    const downloadUpdateCleanup = EventsOn(
       "downloadUpdate",
-      (payload: { downloadId: number; state: number }) => {
-        setDownloads((prevDownloads) =>
-          prevDownloads.map((dl) =>
-            dl.id === payload.downloadId
-              ? models.main.Download.createFrom({
-                  ...dl,
-                  state: payload.state,
-                })
-              : dl,
-          ),
+      (payload: DownloadUpdateEvent) => {
+        console.log("Download update received:", payload);
+
+        setDownloads((prev) =>
+          // @ts-ignore
+          updateDownload(prev, payload.downloadId, (dl) => {
+            const completed =
+              dl.chunk_info?.filter(
+                (c) => c.state === AppDownloadState.Completed,
+              ).length ?? 0;
+
+            return {
+              ...dl,
+              state: payload.state,
+              completed_chunks: completed,
+            };
+          }),
         );
       },
     );
 
+    eventCleanupRef.current = [chunkUpdateCleanup, downloadUpdateCleanup];
+
     return () => {
-      cleanupChunkUpdate();
-      cleanupDownloadUpdate();
+      eventCleanupRef.current.forEach((cleanup) => cleanup());
+      eventCleanupRef.current = [];
     };
   }, []);
 
   useEffect(() => {
-    const interval = setInterval(() => {
-      const newStats: Record<number, any> = {};
-      downloads.forEach((dl) => {
+    if (statsIntervalRef.current) {
+      clearInterval(statsIntervalRef.current);
+    }
+
+    statsIntervalRef.current = setInterval(() => {
+      const currentDownloads = downloadsRef.current;
+      if (currentDownloads.length === 0) return;
+
+      const newStats: Record<number, DownloadStats> = {};
+      currentDownloads.forEach((dl) => {
         newStats[dl.id] = calculateDownloadStats(dl);
       });
+
       setDownloadStats(newStats);
     }, 1000);
 
-    return () => clearInterval(interval);
-  }, [downloads, lastUpdateTime]);
+    return () => {
+      if (statsIntervalRef.current) {
+        clearInterval(statsIntervalRef.current);
+      }
+    };
+  }, [calculateDownloadStats]);
+
+  useEffect(() => {
+    initializeDownloads();
+  }, []);
 
   return (
     <div className="min-h-screen bg-gray-50 p-6">
-      <div className="max-w-4xl mx-auto">
+      <div className="max-w-6xl mx-auto">
         <div className="flex items-center gap-3 mb-6">
           <Download className="w-8 h-8 text-blue-600" />
           <h1 className="text-3xl font-bold text-gray-800">Download Manager</h1>
@@ -283,7 +439,7 @@ export default function Home() {
               return (
                 <div
                   key={dl.id}
-                  className="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden"
+                  className="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden hover:shadow-md transition-shadow"
                 >
                   {/* Main download info */}
                   <div className="p-6">
@@ -300,7 +456,7 @@ export default function Home() {
 
                       <div className="flex items-center gap-2 ml-4">
                         <span
-                          className={`text-sm font-medium ${getStateColor(dl.state)}`}
+                          className={`text-sm font-medium px-2 py-1 rounded-full ${getStateColor(dl.state)} bg-opacity-10`}
                         >
                           {getDownloadStateString(dl.state)}
                         </span>
@@ -314,44 +470,53 @@ export default function Home() {
                           {formatBytes(stats.totalWritten)} /{" "}
                           {formatBytes(dl.size)}
                         </span>
-                        <span className="text-gray-600">
+                        <span className="text-gray-600 font-medium">
                           {stats.progress.toFixed(1)}%
                         </span>
                       </div>
-                      <div className="w-full bg-gray-200 rounded-full h-3">
+                      <div className="w-full bg-gray-200 rounded-full h-3 overflow-hidden">
                         <div
-                          className={`h-3 rounded-full transition-all duration-300 ${getProgressColor(dl.state)}`}
+                          className={`h-3 rounded-full transition-all duration-500 ease-out ${getProgressColor(dl.state)}`}
                           style={{ width: `${Math.min(stats.progress, 100)}%` }}
                         />
                       </div>
                     </div>
 
                     <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4 text-sm">
-                      <div>
-                        <span className="text-gray-500">Speed:</span>
-                        <p className="font-medium">
-                          {dl.state === AppDownloadState.Active
+                      <div className="bg-gray-50 p-3 rounded-lg">
+                        <span className="text-gray-500 block text-xs">
+                          Speed
+                        </span>
+                        <p className="font-semibold text-lg">
+                          {dl.state === AppDownloadState.Active &&
+                          stats.speed > 0
                             ? formatSpeed(stats.speed)
                             : "--"}
                         </p>
                       </div>
-                      <div>
-                        <span className="text-gray-500">ETA:</span>
-                        <p className="font-medium">
-                          {dl.state === AppDownloadState.Active
+                      <div className="bg-gray-50 p-3 rounded-lg">
+                        <span className="text-gray-500 block text-xs">ETA</span>
+                        <p className="font-semibold text-lg">
+                          {dl.state === AppDownloadState.Active && stats.eta > 0
                             ? formatTime(stats.eta)
                             : "--"}
                         </p>
                       </div>
-                      <div>
-                        <span className="text-gray-500">Chunks:</span>
-                        <p className="font-medium">
+                      <div className="bg-gray-50 p-3 rounded-lg">
+                        <span className="text-gray-500 block text-xs">
+                          Chunks
+                        </span>
+                        <p className="font-semibold text-lg">
                           {dl.completed_chunks}/{dl.chunks}
                         </p>
                       </div>
-                      <div>
-                        <span className="text-gray-500">Size:</span>
-                        <p className="font-medium">{formatBytes(dl.size)}</p>
+                      <div className="bg-gray-50 p-3 rounded-lg">
+                        <span className="text-gray-500 block text-xs">
+                          Size
+                        </span>
+                        <p className="font-semibold text-lg">
+                          {formatBytes(dl.size)}
+                        </p>
                       </div>
                     </div>
 
@@ -389,17 +554,17 @@ export default function Home() {
                       {dl.chunk_info && dl.chunk_info.length > 0 && (
                         <button
                           onClick={() => toggleExpanded(dl.id)}
-                          className="flex items-center gap-1 text-gray-500 hover:text-gray-700 text-sm font-medium transition-colors"
+                          className="flex items-center gap-2 text-gray-500 hover:text-gray-700 text-sm font-medium transition-colors"
                         >
                           {isExpanded ? (
                             <>
                               <ChevronUp className="w-4 h-4" />
-                              Hide Chunks
+                              Hide Details
                             </>
                           ) : (
                             <>
                               <ChevronDown className="w-4 h-4" />
-                              Show Chunks
+                              Show Details
                             </>
                           )}
                         </button>
@@ -407,65 +572,133 @@ export default function Home() {
                     </div>
                   </div>
 
+                  {/* Expanded chunk details */}
                   {isExpanded && dl.chunk_info && dl.chunk_info.length > 0 && (
-                    <div className="border-t bg-gray-50 p-6">
-                      <h4 className="text-sm font-semibold text-gray-700 mb-4">
-                        Chunk Progress Details
-                      </h4>
-                      <div className="space-y-3">
-                        {dl.chunk_info
-                          .sort((a, b) => a.index - b.index)
-                          .map((chunk) => {
-                            const chunkTotalSize =
-                              chunk.end_byte - chunk.start_byte + 1;
-                            const chunkProgress =
-                              chunkTotalSize > 0
-                                ? (chunk.written / chunkTotalSize) * 100
-                                : chunk.state === AppDownloadState.Completed
-                                  ? 100
-                                  : 0;
+                    <div className="border-t bg-gradient-to-r from-gray-50 to-gray-100 p-6">
+                      <div className="mb-6">
+                        <h4 className="text-sm font-semibold text-gray-700 mb-3 flex items-center gap-2">
+                          <div className="w-2 h-2 bg-blue-500 rounded-full"></div>
+                          Chunk Progress Heatmap
+                        </h4>
 
-                            return (
-                              <div
-                                key={chunk.id || `chunk-${chunk.index}`}
-                                className="bg-white p-4 rounded-lg border border-gray-200"
-                              >
-                                <div className="flex justify-between items-center mb-2">
-                                  <span className="text-sm font-medium text-gray-700">
-                                    Chunk {chunk.index + 1}
-                                  </span>
-                                  <div className="flex items-center gap-2">
-                                    <span
-                                      className={`text-xs font-medium ${getStateColor(chunk.state)}`}
-                                    >
-                                      {getDownloadStateString(chunk.state)}
-                                    </span>
-                                    <span className="text-xs text-gray-500">
-                                      {chunkProgress.toFixed(1)}%
-                                    </span>
-                                  </div>
-                                </div>
+                        {/* Legend */}
+                        <div className="flex items-center gap-4 mb-4 text-xs">
+                          <div className="flex items-center gap-1">
+                            <div className="w-3 h-3 bg-green-500 rounded"></div>
+                            <span>Completed</span>
+                          </div>
+                          <div className="flex items-center gap-1">
+                            <div className="w-3 h-3 bg-blue-500 rounded"></div>
+                            <span>Downloading</span>
+                          </div>
+                          <div className="flex items-center gap-1">
+                            <div className="w-3 h-3 bg-yellow-500 rounded"></div>
+                            <span>Paused</span>
+                          </div>
+                          <div className="flex items-center gap-1">
+                            <div className="w-3 h-3 bg-gray-200 rounded"></div>
+                            <span>Pending</span>
+                          </div>
+                        </div>
 
-                                <div className="w-full bg-gray-200 rounded-full h-2 mb-2">
+                        {/* Heatmap */}
+                        <div className="bg-white p-4 rounded-lg border">
+                          <div
+                            className="grid gap-1"
+                            style={{
+                              gridTemplateColumns: `repeat(${Math.min(dl.chunk_info.length, 20)}, 1fr)`,
+                            }}
+                          >
+                            {dl.chunk_info
+                              .sort((a, b) => a.index - b.index)
+                              .slice(0, 100)
+                              .map((chunk) => {
+                                const chunkProgress =
+                                  // @ts-ignore
+                                  chunk.size > 0
+                                    ? // @ts-ignore
+                                      (chunk.written / chunk.size) * 100
+                                    : 0;
+                                const stateColor = getChunkStateColor(
+                                  chunk.state,
+                                  chunkProgress,
+                                );
+
+                                return (
                                   <div
-                                    className={`h-2 rounded-full transition-all duration-300 ${getProgressColor(chunk.state)}`}
-                                    style={{
-                                      width: `${Math.min(chunkProgress, 100)}%`,
-                                    }}
-                                  />
-                                </div>
+                                    key={chunk.id || `chunk-${chunk.index}`}
+                                    title={`Chunk ${chunk.index + 1}
+State: ${getDownloadStateString(chunk.state)}
+Progress: ${chunkProgress.toFixed(1)}%
+Written: ${formatBytes(chunk.written)} / ${formatBytes(dl.size / dl.chunks)}`}
+                                    className={`${stateColor} aspect-square rounded transition-all duration-300 hover:scale-110 cursor-pointer`}
+                                    style={{ minHeight: "16px" }}
+                                  >
+                                    {chunk.state ===
+                                      AppDownloadState.Active && (
+                                      <div className="w-full h-full bg-white bg-opacity-30 rounded animate-pulse"></div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                          </div>
 
-                                <div className="text-xs text-gray-500">
-                                  {formatBytes(chunk.written)} /{" "}
-                                  {formatBytes(chunkTotalSize)}
-                                  <span className="ml-2">
-                                    ({formatBytes(chunk.start_byte)} -{" "}
-                                    {formatBytes(chunk.end_byte)})
-                                  </span>
-                                </div>
-                              </div>
-                            );
-                          })}
+                          {dl.chunk_info.length > 100 && (
+                            <p className="text-xs text-gray-500 mt-3 text-center">
+                              Showing first 100 of {dl.chunk_info.length} chunks
+                            </p>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Detailed stats */}
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                        <div className="bg-white p-3 rounded-lg border">
+                          <span className="text-gray-500 block text-xs">
+                            Active Chunks
+                          </span>
+                          <p className="font-semibold text-blue-600">
+                            {
+                              dl.chunk_info.filter(
+                                (c) => c.state === AppDownloadState.Active,
+                              ).length
+                            }
+                          </p>
+                        </div>
+                        <div className="bg-white p-3 rounded-lg border">
+                          <span className="text-gray-500 block text-xs">
+                            Paused Chunks
+                          </span>
+                          <p className="font-semibold text-yellow-600">
+                            {
+                              dl.chunk_info.filter(
+                                (c) => c.state === AppDownloadState.Paused,
+                              ).length
+                            }
+                          </p>
+                        </div>
+                        <div className="bg-white p-3 rounded-lg border">
+                          <span className="text-gray-500 block text-xs">
+                            Completed Chunks
+                          </span>
+                          <p className="font-semibold text-green-600">
+                            {
+                              dl.chunk_info.filter(
+                                (c) => c.state === AppDownloadState.Completed,
+                              ).length
+                            }
+                          </p>
+                        </div>
+                        <div className="bg-white p-3 rounded-lg border">
+                          <span className="text-gray-500 block text-xs">
+                            Average Chunk Size
+                          </span>
+                          <p className="font-semibold text-gray-700">
+                            {dl.chunks > 0
+                              ? formatBytes(dl.size / dl.chunks)
+                              : "--"}
+                          </p>
+                        </div>
                       </div>
                     </div>
                   )}
