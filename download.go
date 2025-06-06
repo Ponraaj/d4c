@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -33,7 +34,7 @@ type Download struct {
 	Mutex           sync.Mutex      `json:"-" `
 	WaitGroup       sync.WaitGroup  `json:"-"`
 	Client          *http.Client    `json:"-"`
-	CompletedChunks int             `json:"completed_chunks"`
+	CompletedChunks int64           `json:"completed_chunks"`
 	WorkersCount    int             `json:"workers"`
 	ChunkWriter     ChunkWriter     `json:"-"`
 	WorkerChannel   chan *ChunkInfo `json:"-"`
@@ -166,7 +167,7 @@ func (d *Download) DownloadChunk(ctx context.Context, chunk *ChunkInfo) error {
 		d.Mutex.Lock()
 		if chunk.State != StateCompleted {
 			chunk.State = StateCompleted
-			d.CompletedChunks++
+			atomic.AddInt64(&d.CompletedChunks, 1)
 		}
 		d.Mutex.Unlock()
 		if d.ChunkWriter != nil {
@@ -241,7 +242,7 @@ func (d *Download) DownloadChunk(ctx context.Context, chunk *ChunkInfo) error {
 					d.Mutex.Lock()
 					if chunk.State != StateCompleted {
 						chunk.State = StateCompleted
-						d.CompletedChunks++
+						atomic.AddInt64(&d.CompletedChunks, 1)
 					}
 					if d.ChunkWriter != nil {
 						err := d.ChunkWriter.UpdateChunkState(chunk)
@@ -347,7 +348,6 @@ func (d *Download) Start(ctx context.Context) error {
 	}
 	d.WaitGroup = sync.WaitGroup{}
 	for i := 0; i < d.WorkersCount; i++ {
-		d.WaitGroup.Add(1)
 		go d.worker(ctx)
 	}
 
@@ -357,6 +357,7 @@ func (d *Download) Start(ctx context.Context) error {
 		}
 		d.WorkerChannel <- chunk
 	}
+	close(d.WorkerChannel)
 
 	done := make(chan struct{})
 	go func() {
@@ -366,12 +367,14 @@ func (d *Download) Start(ctx context.Context) error {
 
 	select {
 	case <-done:
-		if !d.isAllChunksCompleted() {
-			return fmt.Errorf("not all chunks completed successfully")
-		}
-
 		if d.State == StateCancelled {
 			return fmt.Errorf("download cancelled")
+		}
+
+		fmt.Printf("Chunks completed: %d / %d\n", d.CompletedChunks, d.ChunkCount)
+
+		if int64(d.ChunkCount) != d.CompletedChunks {
+			return fmt.Errorf("not all chunks completed successfully")
 		}
 
 		if err := d.combineChunks(); err != nil {
@@ -393,6 +396,7 @@ func (d *Download) Start(ctx context.Context) error {
 }
 
 func (d *Download) worker(ctx context.Context) {
+	d.WaitGroup.Add(1)
 	defer d.WaitGroup.Done()
 	for {
 		select {
@@ -412,18 +416,6 @@ func (d *Download) worker(ctx context.Context) {
 			}
 		}
 	}
-}
-
-func (d *Download) isAllChunksCompleted() bool {
-	d.Mutex.Lock()
-	defer d.Mutex.Unlock()
-
-	for _, chunk := range d.Chunks {
-		if chunk.State != StateCompleted {
-			return false
-		}
-	}
-	return true
 }
 
 func (d *Download) notify(chunk *ChunkInfo) {

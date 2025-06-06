@@ -210,9 +210,14 @@ func (dm *DownloadManager) StartDownload(id int64) error {
 	dm.ActiveContexts[id] = cancel
 
 	go func() {
-		err := d.Start(ctx)
-		if err != nil {
-			fmt.Errorf("error starting download: %w", err)
+		defer func() {
+			cancel()
+			dm.Mutex.Lock()
+			delete(dm.ActiveContexts, id)
+			dm.Mutex.Unlock()
+		}()
+		if err := d.Start(ctx); err != nil && err.Error() != "download canceled" {
+			fmt.Printf("error starting download: %v\n", err)
 		}
 	}()
 	return nil
