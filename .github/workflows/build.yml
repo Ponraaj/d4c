@@ -1,0 +1,33 @@
+name: Wails build
+
+on:
+  push:
+    branches:
+      - master
+
+env:
+  NODE_OPTIONS: "--max-old-space-size=4096"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        build:
+          [
+            { name: d4c, platform: linux/amd64, os: ubuntu-latest },
+            { name: d4c, platform: windows/amd64, os: windows-latest },
+            { name: d4c, platform: darwin/universal, os: macos-latest },
+          ]
+    runs-on: ${{ matrix.build.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dAppServer/wails-build-action@main
+        with:
+          build-name: ${{ matrix.build.name }}
+          build-platform: ${{ matrix.build.platform }}
+          build-obfuscate: true
+          go-version: "1.23"
+          node-version: "20.x"
