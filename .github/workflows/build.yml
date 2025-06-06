@@ -27,10 +27,13 @@ jobs:
       - uses: pnpm/action-setup@v2
         with:
           version: 10.7
-      - uses: ./.github/actions/wailsBuild
+      - name: Build
+        uses: ./.github/actions/wailsBuild
         with:
           build-name: ${{ matrix.build.name }}
           build-platform: ${{ matrix.build.platform }}
           build-obfuscate: true
           go-version: "1.23"
           node-version: "20.x"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
