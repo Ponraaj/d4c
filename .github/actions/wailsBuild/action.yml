@@ -208,6 +208,41 @@ runs:
       working-directory: ${{ inputs.app-working-directory }}
       run: chmod +x build/bin/*
       shell: bash
+
+    # Rename binaries with platform suffix
+    - name: Rename Linux binary
+      if: inputs.build == 'true' && runner.os == 'Linux'
+      working-directory: ${{ inputs.app-working-directory }}
+      shell: bash
+      run: |
+        if [ -f "build/bin/${{inputs.build-name}}" ]; then
+          mv "build/bin/${{inputs.build-name}}" "build/bin/${{inputs.build-name}}-linux"
+        fi
+
+    - name: Rename Windows binary
+      if: inputs.build == 'true' && runner.os == 'Windows'
+      working-directory: ${{ inputs.app-working-directory }}
+      shell: bash
+      run: |
+        if [ -f "build/bin/${{inputs.build-name}}.exe" ]; then
+          mv "build/bin/${{inputs.build-name}}.exe" "build/bin/${{inputs.build-name}}-windows.exe"
+        fi
+        if [ -f "build/bin/${{inputs.build-name}}-amd64-installer.exe" ]; then
+          mv "build/bin/${{inputs.build-name}}-amd64-installer.exe" "build/bin/${{inputs.build-name}}-windows-installer.exe"
+        fi
+
+    - name: Rename macOS binary
+      if: inputs.build == 'true' && runner.os == 'macOS'
+      working-directory: ${{ inputs.app-working-directory }}
+      shell: bash
+      run: |
+        if [ -f "build/bin/${{inputs.build-name}}.app.zip" ]; then
+          mv "build/bin/${{inputs.build-name}}.app.zip" "build/bin/${{inputs.build-name}}-macos.app.zip"
+        fi
+        if [ -f "build/bin/${{inputs.build-name}}.pkg" ]; then
+          mv "build/bin/${{inputs.build-name}}.pkg" "build/bin/${{inputs.build-name}}-macos.pkg"
+        fi
+
     # Package and Sign MacOS
     - name: Import Code-Signing Certificates for macOS
       if: runner.os == 'macOS' && inputs.sign != 'false' && startsWith(github.ref, 'refs/tags/')
@@ -270,8 +305,8 @@ runs:
         Set-Content -Path certificate\certificate.txt -Value '${{ inputs.sign-windows-cert }}'
         certutil -decode certificate\certificate.txt certificate\certificate.pfx
         echo "Signing our binaries"
-        & 'C:/Program Files (x86)/Windows Kits/10/bin/10.0.17763.0/x86/signtool.exe' sign /fd sha256 /tr http://ts.ssl.com /f certificate\certificate.pfx /p '${{ inputs.sign-windows-cert-password }}' .\build\bin\${{inputs.build-name}}.exe
-        echo "Signing Installer" & 'C:/Program Files (x86)/Windows Kits/10/bin/10.0.17763.0/x86/signtool.exe' sign /fd sha256 /tr http://ts.ssl.com /f certificate\certificate.pfx /p '${{ inputs.sign-windows-cert-password }}' .\build\bin\${{inputs.build-name}}-amd64-installer.exe
+        & 'C:/Program Files (x86)/Windows Kits/10/bin/10.0.17763.0/x86/signtool.exe' sign /fd sha256 /tr http://ts.ssl.com /f certificate\certificate.pfx /p '${{ inputs.sign-windows-cert-password }}' .\build\bin\${{inputs.build-name}}-windows.exe
+        echo "Signing Installer" & 'C:/Program Files (x86)/Windows Kits/10/bin/10.0.17763.0/x86/signtool.exe' sign /fd sha256 /tr http://ts.ssl.com /f certificate\certificate.pfx /p '${{ inputs.sign-windows-cert-password }}' .\build\bin\${{inputs.build-name}}-windows-installer.exe
 
     # Upload build assets
     - uses: actions/upload-artifact@v4
@@ -286,6 +321,10 @@ runs:
       if: inputs.package == 'true' && startsWith(github.ref, 'refs/tags/')
       with:
         files: |
-          */bin/*
+          ${{ inputs.app-working-directory }}/build/bin/${{inputs.build-name}}-linux
+          ${{ inputs.app-working-directory }}/build/bin/${{inputs.build-name}}-windows.exe
+          ${{ inputs.app-working-directory }}/build/bin/${{inputs.build-name}}-windows-installer.exe
+          ${{ inputs.app-working-directory }}/build/bin/${{inputs.build-name}}-macos.app.zip
+          ${{ inputs.app-working-directory }}/build/bin/${{inputs.build-name}}-macos.pkg
       env:
         GITHUB_TOKEN: ${{ env.GITHUB_TOKEN }}
