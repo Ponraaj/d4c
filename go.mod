@@ -1,4 +1,4 @@
-module d4c
+module github.com/ponraaj/d4c
 
 go 1.23
 
